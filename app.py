@@ -1,60 +1,59 @@
-import os
 import socket
 import threading
-import logging
-from socketserver import ThreadingMixIn, TCPServer
+import socketserver
 
-logging.basicConfig(level=logging.INFO)
-
-class ThreadedTCPServer(ThreadingMixIn, TCPServer):
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     pass
 
-class SocksProxy:
-    def __init__(self, source_socket):
-        self.source = source_socket
-        self.target = None
-
+class SocksProxy(socketserver.BaseRequestHandler):
     def handle(self):
         try:
-            data = self.source.recv(4096)
-            if data:
-                # Здесь можно добавить логику обработки SOCKS
-                # Упрощённая версия: перенаправляем трафик
-                target_host = "example.com"  # Замените на ваш целевой хост
-                target_port = 80
+            print(f"Connection from: {self.client_address}")
+            # SOCKS5 handshake
+            self.request.recv(4096)
+            self.request.sendall(b"\x05\x00")
+            
+            # Request details
+            data = self.request.recv(4096)
+            version, cmd, _, addr_type = data[:4]
+            
+            if addr_type == 1:  # IPv4
+                addr = socket.inet_ntoa(data[4:8])
+                port = int.from_bytes(data[8:10], 'big')
+            else:
+                self.request.close()
+                return
                 
-                self.target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.target.connect((target_host, target_port))
-                self.target.sendall(data)
-                
-                threading.Thread(target=self.forward, args=(self.source, self.target)).start()
-                threading.Thread(target=self.forward, args=(self.target, self.source)).start()
+            # Connect to target
+            remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote.connect((addr, port))
+            
+            # Send success response
+            self.request.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00")
+            
+            # Start tunneling
+            self.tunnel(self.request, remote)
+            
         except Exception as e:
-            logging.error(f"Error: {e}")
+            print(f"Error: {e}")
 
-    def forward(self, src, dst):
+    def tunnel(self, client, remote):
         while True:
             try:
-                data = src.recv(4096)
+                data = client.recv(4096)
                 if not data: break
-                dst.sendall(data)
+                remote.sendall(data)
+                
+                reply = remote.recv(4096)
+                if not reply: break
+                client.sendall(reply)
+                
             except:
                 break
-
-def main():
-    HOST = "0.0.0.0"
-    PORT = int(os.environ.get("PORT", 10000))
-    
-    server = ThreadedTCPServer((HOST, PORT), lambda *args: None)
-    server.request_queue_size = 20
-    
-    logging.info(f"Server started on port {PORT}")
-    
-    while True:
-        client_socket, addr = server.get_request()
-        logging.info(f"New connection: {addr}")
-        proxy = SocksProxy(client_socket)
-        threading.Thread(target=proxy.handle).start()
+        client.close()
+        remote.close()
 
 if __name__ == "__main__":
-    main()
+    HOST, PORT = "0.0.0.0", 443
+    server = ThreadedTCPServer((HOST, PORT), SocksProxy)
+    server.serve_forever()
