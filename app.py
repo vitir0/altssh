@@ -3,6 +3,7 @@ import socket
 import select
 import threading
 import logging
+import time  # Добавлен недостающий импорт
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -93,15 +94,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             logger.error(f"Ошибка обработки запроса: {e}")
             self.send_error(500, "Internal Server Error")
         finally:
-            if hasattr(self, 'target_sock') and self.target_sock:
-                self.target_sock.close()
+            if target_sock:
+                target_sock.close()
     
     def do_CONNECT(self):
         """Обработка HTTPS-соединений"""
         try:
             # Парсим хост и порт
-            host, port = self.path.split(':')
-            port = int(port) if port else 443
+            parts = self.path.split(':')
+            host = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else 443
             
             # Создаем соединение с целевым сервером
             target_sock = self._connect_to_target(host, port)
@@ -142,6 +144,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get('PORT', 443))
+    logger.info(f"Старт сервера на порту {port}")
     
     # Запускаем HTTP-сервер в отдельном потоке
     http_server = ThreadedHTTPServer('0.0.0.0', port)
@@ -156,5 +159,5 @@ def main():
         http_server.stop()
 
 if __name__ == '__main__':
-    logger.info("Запуск сервера...")
+    logger.info("Инициализация прокси-сервера...")
     main()
