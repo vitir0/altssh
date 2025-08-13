@@ -63,34 +63,44 @@ class HybridServer:
         """Реализация простого SOCKS5 прокси"""
         try:
             # Этап 1: Аутентификация
-            client_socket.recv(256)  # Читаем приветствие
-            client_socket.sendall(b'\x05\x00')  # NO AUTH
+            version = client_socket.recv(1)
+            if version != b'\x05':
+                client_socket.close()
+                return
+
+            nmethods = client_socket.recv(1)[0]
+            methods = client_socket.recv(nmethods)
             
+            client_socket.sendall(b'\x05\x00')  # NO AUTH REQUIRED
+
             # Этап 2: Запрос на подключение
-            data = client_socket.recv(4)
-            if len(data) < 4:
-                raise ValueError("Неверный запрос")
-                
-            version, cmd, _, addr_type = data
-            if version != 5 or cmd != 1:  # Только CONNECT
-                raise ValueError("Неподдерживаемая команда")
-            
+            request = client_socket.recv(4)
+            if len(request) < 4:
+                client_socket.close()
+                return
+
+            _, cmd, _, addr_type = request
+            if cmd != 1:  # Only CONNECT supported
+                client_socket.close()
+                return
+
             # Чтение адреса назначения
             if addr_type == 1:  # IPv4
                 addr = socket.inet_ntoa(client_socket.recv(4))
+                port = int.from_bytes(client_socket.recv(2), 'big')
             elif addr_type == 3:  # Доменное имя
                 domain_length = client_socket.recv(1)[0]
                 addr = client_socket.recv(domain_length).decode()
+                port = int.from_bytes(client_socket.recv(2), 'big')
             else:
-                raise ValueError("Неподдерживаемый тип адреса")
-                
-            # Чтение порта назначения
-            port = int.from_bytes(client_socket.recv(2), 'big')
-            
+                client_socket.close()
+                return
+
             logger.info(f"Запрос на подключение к {addr}:{port}")
             
             # Устанавливаем соединение с целевым сервером
             remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            remote_socket.settimeout(10)
             remote_socket.connect((addr, port))
             
             # Отправляем успешный ответ
@@ -119,14 +129,16 @@ class HybridServer:
         try:
             while self.running:
                 # Проверяем данные от клиента
-                if client in socket.select([client], [], [], 1)[0]:
+                rlist, _, _ = socket.select([client], [], [], 1)
+                if client in rlist:
                     data = client.recv(4096)
                     if not data: 
                         break
                     remote.sendall(data)
                 
                 # Проверяем данные от сервера
-                if remote in socket.select([remote], [], [], 1)[0]:
+                rlist, _, _ = socket.select([remote], [], [], 1)
+                if remote in rlist:
                     data = remote.recv(4096)
                     if not data: 
                         break
@@ -139,19 +151,35 @@ class HybridServer:
                 remote.close()
             except:
                 pass
+            try:
+                client.close()
+            except:
+                pass
 
     def handle_client(self, client_socket, client_address):
         """Определяем тип подключения и обрабатываем"""
         try:
-            # Проверяем первый байт для определения типа подключения
-            first_byte = client_socket.recv(1, socket.MSG_PEEK)
+            # Читаем первые 3 байта для точного определения типа подключения
+            header = client_socket.recv(3, socket.MSG_PEEK)
             
-            if first_byte == b'\x05':  # SOCKS5
+            if len(header) < 3:
+                logger.info("Слишком короткий заголовок, закрываем соединение")
+                client_socket.close()
+                return
+
+            # SOCKS5: версия 5, количество методов > 0
+            if header[0] == 0x05 and header[1] > 0:
                 logger.info(f"Обнаружено SOCKS5 подключение от {client_address}")
                 self.handle_socks5(client_socket)
-            else:  # Предполагаем HTTP (для healthcheck)
+                
+            # HTTP: первые 3 символа - GET, POS, OPT и т.д.
+            elif header[:3] in (b'GET', b'POS', b'PUT', b'DEL', b'OPT', b'HEA'):
                 logger.info(f"Обнаружено HTTP подключение от {client_address}")
                 self.handle_healthcheck(client_socket)
+                
+            else:
+                logger.warning(f"Неизвестный тип подключения от {client_address}")
+                client_socket.close()
                 
         except Exception as e:
             logger.error(f"Ошибка обработки клиента: {e}")
@@ -165,6 +193,7 @@ class HybridServer:
         while self.running:
             try:
                 client_socket, client_address = self.server_socket.accept()
+                client_socket.settimeout(10)  # Таймаут 10 секунд
                 logger.info(f"Принято подключение от {client_address}")
                 
                 # Обработка клиента в отдельном потоке
