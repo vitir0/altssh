@@ -3,6 +3,7 @@ import threading
 import logging
 import time
 import os
+import select
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,12 +20,9 @@ class HybridServer:
         self.port = port
         self.server_socket = None
         self.running = True
-        
-        # Создаем сокет
         self.create_socket()
         
     def create_socket(self):
-        """Создаем и настраиваем сокет"""
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -36,8 +34,8 @@ class HybridServer:
             self.running = False
 
     def handle_healthcheck(self, client_socket):
-        """Обработка healthcheck запросов от Render.com"""
         try:
+            client_socket.settimeout(5)  # Таймаут 5 секунд
             request = client_socket.recv(1024)
             if b'GET /health' in request:
                 response = (
@@ -49,10 +47,7 @@ class HybridServer:
                 client_socket.sendall(response)
                 logger.info("Отправлен ответ на healthcheck")
             else:
-                response = (
-                    b'HTTP/1.1 404 Not Found\r\n'
-                    b'Connection: close\r\n\r\n'
-                )
+                response = b'HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'
                 client_socket.sendall(response)
         except Exception as e:
             logger.error(f"Ошибка healthcheck: {e}")
@@ -60,40 +55,33 @@ class HybridServer:
             client_socket.close()
 
     def handle_socks5(self, client_socket):
-        """Реализация простого SOCKS5 прокси"""
         try:
-            # Этап 1: Аутентификация
-            version = client_socket.recv(1)
-            if version != b'\x05':
-                client_socket.close()
-                return
-
-            nmethods = client_socket.recv(1)[0]
-            methods = client_socket.recv(nmethods)
+            client_socket.settimeout(10)  # Таймаут 10 секунд
             
+            # Этап 1: Аутентификация
+            data = client_socket.recv(2)  # Версия + количество методов
+            if len(data) < 2 or data[0] != 0x05:
+                return
+                
+            nmethods = data[1]
+            methods = client_socket.recv(nmethods)
             client_socket.sendall(b'\x05\x00')  # NO AUTH REQUIRED
 
             # Этап 2: Запрос на подключение
             request = client_socket.recv(4)
-            if len(request) < 4:
-                client_socket.close()
-                return
-
-            _, cmd, _, addr_type = request
-            if cmd != 1:  # Only CONNECT supported
-                client_socket.close()
+            if len(request) < 4 or request[1] != 0x01:  # Только CONNECT
                 return
 
             # Чтение адреса назначения
-            if addr_type == 1:  # IPv4
+            addr_type = request[3]
+            if addr_type == 0x01:  # IPv4
                 addr = socket.inet_ntoa(client_socket.recv(4))
                 port = int.from_bytes(client_socket.recv(2), 'big')
-            elif addr_type == 3:  # Доменное имя
+            elif addr_type == 0x03:  # Доменное имя
                 domain_length = client_socket.recv(1)[0]
                 addr = client_socket.recv(domain_length).decode()
                 port = int.from_bytes(client_socket.recv(2), 'big')
             else:
-                client_socket.close()
                 return
 
             logger.info(f"Запрос на подключение к {addr}:{port}")
@@ -104,9 +92,7 @@ class HybridServer:
             remote_socket.connect((addr, port))
             
             # Отправляем успешный ответ
-            bind_addr = socket.inet_aton('0.0.0.0')
-            bind_port = 0
-            response = b'\x05\x00\x00\x01' + bind_addr + bind_port.to_bytes(2, 'big')
+            response = b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00'
             client_socket.sendall(response)
             
             # Начинаем передачу данных
@@ -125,20 +111,18 @@ class HybridServer:
                 pass
 
     def relay_traffic(self, client, remote):
-        """Передача данных между клиентом и удаленным сервером"""
         try:
-            while self.running:
-                # Проверяем данные от клиента
-                rlist, _, _ = socket.select([client], [], [], 1)
-                if client in rlist:
+            while True:
+                # Ожидаем активности с любой стороны
+                r, w, e = select.select([client, remote], [], [], 60)
+                
+                if client in r:
                     data = client.recv(4096)
                     if not data: 
                         break
                     remote.sendall(data)
                 
-                # Проверяем данные от сервера
-                rlist, _, _ = socket.select([remote], [], [], 1)
-                if remote in rlist:
+                if remote in r:
                     data = remote.recv(4096)
                     if not data: 
                         break
@@ -157,28 +141,37 @@ class HybridServer:
                 pass
 
     def handle_client(self, client_socket, client_address):
-        """Определяем тип подключения и обрабатываем"""
         try:
-            # Читаем первые 3 байта для точного определения типа подключения
-            header = client_socket.recv(3, socket.MSG_PEEK)
+            logger.info(f"Ожидание данных от {client_address}")
             
-            if len(header) < 3:
-                logger.info("Слишком короткий заголовок, закрываем соединение")
+            # Ждем данные до 5 секунд
+            ready = select.select([client_socket], [], [], 5)
+            if not ready[0]:
+                logger.warning(f"Таймаут ожидания данных от {client_address}")
                 client_socket.close()
                 return
+                
+            # Получаем первые 3 байта без извлечения из буфера
+            header = client_socket.recv(3, socket.MSG_PEEK)
+            if not header:
+                logger.info(f"Соединение закрыто клиентом {client_address}")
+                client_socket.close()
+                return
+                
+            logger.info(f"Получено от {client_address}: {header.hex()}")
 
-            # SOCKS5: версия 5, количество методов > 0
-            if header[0] == 0x05 and header[1] > 0:
+            # SOCKS5: версия 5
+            if header[0] == 0x05:
                 logger.info(f"Обнаружено SOCKS5 подключение от {client_address}")
                 self.handle_socks5(client_socket)
                 
-            # HTTP: первые 3 символа - GET, POS, OPT и т.д.
-            elif header[:3] in (b'GET', b'POS', b'PUT', b'DEL', b'OPT', b'HEA'):
+            # HTTP
+            elif header.startswith(b'GET') or header.startswith(b'POS') or header.startswith(b'HEA'):
                 logger.info(f"Обнаружено HTTP подключение от {client_address}")
                 self.handle_healthcheck(client_socket)
                 
             else:
-                logger.warning(f"Неизвестный тип подключения от {client_address}")
+                logger.warning(f"Неизвестный протокол от {client_address}: {header}")
                 client_socket.close()
                 
         except Exception as e:
@@ -189,14 +182,11 @@ class HybridServer:
                 pass
 
     def start(self):
-        """Основной цикл сервера"""
         while self.running:
             try:
                 client_socket, client_address = self.server_socket.accept()
-                client_socket.settimeout(10)  # Таймаут 10 секунд
                 logger.info(f"Принято подключение от {client_address}")
                 
-                # Обработка клиента в отдельном потоке
                 client_thread = threading.Thread(
                     target=self.handle_client,
                     args=(client_socket, client_address),
@@ -210,7 +200,6 @@ class HybridServer:
                 break
 
     def stop(self):
-        """Остановка сервера"""
         self.running = False
         try:
             if self.server_socket:
@@ -220,10 +209,7 @@ class HybridServer:
         logger.info("Сервер остановлен")
 
 if __name__ == "__main__":
-    # Получаем порт из переменных окружения Render.com
     PORT = int(os.environ.get('PORT', 443))
-    
-    # Ждем 10 секунд перед запуском (для инициализации сети)
     logger.info("Ожидание 10 секунд для инициализации...")
     time.sleep(10)
     
